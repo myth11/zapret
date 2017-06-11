@@ -29,6 +29,7 @@ use Getopt::Long;
 use URI::UTF8::Punycode;
 use File::Path qw(make_path);
 use File::Copy;
+use LWP::Simple;
 
 $XML::Simple::PREFERRED_PARSER = 'XML::Parser';
 
@@ -124,9 +125,10 @@ my $mail_alone = $Config->{'MAIL.alone'} || 0;
 my $form_request = $Config->{'API.form_request'} || 0;
 
 my $our_blacklist = $Config->{'PATH.our_blacklist'} || "";
+my $file_minust = $Config->{'PATH.file_minust'} || "";
 
 my $ldd_iterations = 0;
-
+my $conn_iterations = 0;
 ######## End config #####
 
 my $DBH;
@@ -197,7 +199,6 @@ if( $lastResult eq 'send' )
 		$logger->info("Reestr not yet ready. Waiting...");
 		sleep(10);
 	}
-	$logger->info("Stopping RKN at ".(localtime()));
 	exit 0;
 }
 
@@ -212,14 +213,12 @@ if(checkDumpDate())
 	}
 }
 
-$logger->info("Stopping RKN at ".(localtime()));
-
 exit 0;
 
 sub getResult
 {
 	$logger->debug("Getting result...");
-
+	$conn_iterations++;
 	my @result;
 	eval
 	{
@@ -228,8 +227,16 @@ sub getResult
 
 	if( $@ )
 	{
-		$logger->fatal("Error while getResult(): ".$@);
-		exit;
+		$logger->fatal("Error while getResult(): ");
+#		exit;
+                if( $conn_iterations < 11 ) {
+                        $logger->info("Retrying...");
+                        return getResult();
+                } else {
+                        $logger->fatal("10 attempts for connect failed, exiting");
+                        exit;
+                }
+
 	}
 
 	if( !@result )
@@ -258,25 +265,25 @@ sub getResult
 		unlink $dir.'/dump.xml.sig';
 		my $zip = decode_base64($result[1]);
 
-		my $file = "arch.zip";
-		my $tm=time();
-		if($archive_path)
-		{
-			$file = strftime "arch-%Y-%m-%d-%H_%M_%S.zip", localtime($tm);
-		}
+               my $file = "arch.zip";
+               my $tm=time();
+               if($archive_path)
+               {
+                       $file = strftime "arch-%Y-%m-%d-%H_%M_%S.zip", localtime($tm);
+               }
 
-		open F, '>'.$dir."/".$file || die "Can't open $dir/$file for writing!\n".$! ;
+               open F, '>'.$dir."/".$file || die "Can't open $dir/$file for writing!\n".$! ;
 		binmode F;
 		print F $zip;
 		close F;
-		`unzip -o $dir/$file -d $dir/`;
-		if($archive_path)
-		{
-			my $apath = strftime "$archive_path/%Y/%Y-%m/%Y-%m-%d", localtime($tm);
-			make_path($apath);
-			copy($dir."/".$file,$apath."/".$file);
-			unlink $dir."/".$file;
-		}
+               `unzip -o $dir/$file -d $dir/`;
+               if($archive_path)
+               {
+                       my $apath = strftime "$archive_path/%Y/%Y-%m/%Y-%m-%d", localtime($tm);
+                       make_path($apath);
+                       copy($dir."/".$file,$apath."/".$file);
+                       unlink $dir."/".$file;
+               }
 
 		$logger->debug("Got result, parsing dump.");
 
@@ -289,6 +296,10 @@ sub getResult
 		$logger->info("Load iterations: ".$ldd_iterations.", resolved domains ipv4: ".$resolved_domains_ipv4.", resolved domains ipv6: ".$resolved_domains_ipv6);
 		$logger->info("Added: domains: ".$added_domains.", urls: ".$added_urls.", IPv4 ips: ".$added_ipv4_ips.", IPv6 ips: ".$added_ipv6_ips.", subnets: ".$added_subnets.", records: ".$added_records);
 		$logger->info("Deleted: old domains: ".$deleted_old_domains.", old urls: ".$deleted_old_urls.", old ips: ".$deleted_old_ips.", old only ips: ".$deleted_old_only_ips.", old subnets: ".$deleted_old_subnets.", old records: ".$deleted_old_records);
+		my $stop_time=localtime();
+		$logger->info("Stopping RKN at ".$stop_time);
+                 system('/usr/local/zapret-info/nfqfilter_config/make_files.pl');
+
 	}
 	return 0;
 }
@@ -301,7 +312,7 @@ sub checkDumpDate
 	$logger->debug("RKN last dump date: ".$lastDumpDate);
 	if( $lastDumpDateOld eq '' || $lastDumpDate > $lastDumpDateOld || $force_load)
 	{
-		$logger->debug("lastDumpDate > prev. dump date. Working now.");
+		$logger->info("lastDumpDate > prev. dump date. Working now.");
 		return 1;
 	}
 	$logger->info("lastDumpDate <= prev. dump date. Exiting.");
@@ -569,6 +580,7 @@ sub parseDump
 	processNew($resolver,$cv);
 
 	proceedOurBlacklist($resolver,$cv) if($our_blacklist ne "");
+        proceedminust($resolver,$cv) if($file_minust ne "");
 
 	if($resolve == 1)
 	{
@@ -659,11 +671,25 @@ sub processNew {
 
 		# URLs
 		my $processed_urls=0;
+                my $need_to_block_domain=0;
+                my $need_to_block_ip=0;
+		my $test_dom=0;
+my $test_dom_h=0;
 		if( ref($NEW{$d_id}->{urls}) eq 'ARRAY' )
 		{
 			foreach my $url ( @{$NEW{$d_id}->{urls}} )
 			{
-				$processed_urls++;
+####################URL Длиннее 1024 символов блокируются по IP############################
+				if((my $len = length($url)) < 1024)
+				{
+					$processed_urls++;
+				} else {
+					$need_to_block_ip=1;
+					$OLD_URLS{md5_hex(encode_utf8($url))} = 0;
+					$logger->info("Skip longer URL, blocking by IP: ".$url . "Lenght: ".$len);
+				}
+###########################################################################################
+
 				# Check for ex. domain
 				my $uri = URI->new($url);
 				my $scheme = $uri->scheme();
@@ -672,22 +698,27 @@ sub processNew {
 					$logger->error("Unsupported scheme in url: $url for resolving.");
 				} else {
 					my $url_domain = $uri->host();
-					#my @res = ( $url =~ m!^(?:http://|https://)?([^(/|\?)]+)!i );
-					#my $url_domain = $res[0];
 					if( defined( $EX_DOMAINS{$url_domain} ) ) {
-	#					binmode(STDOUT, ':utf8');
-	#					print "EXCLUDE DOMAIN ".$url_domain." (URL ".$url.")\n";
 						$MAIL_EXCLUDES .= "Excluding URL (caused by excluded domain ".$url_domain."): ".$url."\n";
 						next;
 					}
 					Resolve( $url_domain, $record_id, $resolver, $cv);
 				}
-				
+
+#################### Если URL ведет в корень сайт, то блокируем домен ##################### 				
+				my $test_dom = $uri->path;
+				my @ipp=split(/\:/,$url);
+				if(($test_dom eq '' || $test_dom eq '/') && scalar(@ipp) != 3)
+                                {
+					if($url !~ /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)
+						{
+						$need_to_block_domain=1;
+						$OLD_URLS{md5_hex(encode_utf8($url))} = 0;
+						}
+				}
+###########################################################################################
 				
 				if( !defined( $OLD_URLS{md5_hex(encode_utf8($url))} ) ) {
-#				    binmode(STDOUT, ':utf8');
-#				    print "New URL: ".encode_utf8($url)."\n";
-#				    print "MD5 hex: ".md5_hex(encode_utf8($url))."\n";
 				    $sth = $DBH->prepare("INSERT INTO zap2_urls(record_id, url) VALUES(?,?)");
 				    $sth->bind_param(1, $record_id);
 				    $sth->bind_param(2, $url);
@@ -702,7 +733,7 @@ sub processNew {
 				}
 			}
 		}
-		my $need_to_block_domain=0;
+#		my $need_to_block_domain=0;
 		if(!$processed_urls)
 		{
 			$logger->debug("Item $d_id hasn't defined URL, must block by DOMAIN");
@@ -719,13 +750,13 @@ sub processNew {
 				if( defined( $EX_DOMAINS{$domain} ) ) {
 	#				print "EXCLUDE DOMAIN: ".$domain."\n";
 					$MAIL_EXCLUDES .= "Excluding domain: ".$domain."\n";
-					$logger->debug("Excluding domain: ".$domain);
+					$logger->info("Excluding domain: ".$domain);
 					next;
 				}
 				$processed_domains++;
 				if($domain =~ /^\*\./)
 				{
-					$logger->info("Skip to resolve domain '$domain' because it masked");
+					$logger->debug("Skip to resolve domain '$domain' because it masked");
 				} else {
 					Resolve( $domain, $record_id, $resolver, $cv );
 				}
@@ -745,7 +776,7 @@ sub processNew {
 				}
 			}
 		}
-		my $need_to_block_ip=0;
+#		my $need_to_block_ip=0;
 		if(!$processed_urls && !$processed_domains)
 		{
 			$logger->debug("Item $d_id hasn't url and domain, need to block by IP");
@@ -784,20 +815,21 @@ sub processNew {
 						if( $ipadr->within($net) ) {
 #							print "Excluding ip ".$ip.": overlaps with excluded subnet ".$subnet."\n";
 							$MAIL_EXCLUDES .= "Excluding ip ".$ip.": overlaps with excluded subnet ".$subnet."\n";
-							$logger->debug("Excluding ip ".$ip);
+							$logger->info("Excluding ip_dump ".$ip);
 							$exclude = 1;
 							last;
 						}
 					}
 				}
-				next if( $exclude == 1 );
+                               next if( $exclude == 1 );
 				
 				# Check for ex. ip
 				if( defined($EX_IPS{$ip}) )
 				{
 #					print "Excluding ip ".$ip.": match excluded ip in DB.\n";
 					$MAIL_EXCLUDES .= "Excluding ip ".$ip.": match excluded ip in DB.\n";
-					$logger->debug("Excluding ip ".$ip);
+					$logger->info("Excluding ip_dump ".$ip);
+					$exclude = 1;
 					next;
 				}
 				
@@ -841,8 +873,9 @@ sub processNew {
 						if( $ipadr->within($net) ) {
 #							print "Exclude subnet ".$subnet.": contains excluded IP ".$ip."\n";
 							$MAIL_EXCLUDES .= "Excluding subnet ".$subnet.": contains excluded ip ".$ip."\n";
-							$logger->debug("Excluding subnet ".$subnet);
+							$logger->info("Excluding subnet_dump ".$subnet);
 							$exclude = 1;
+							next; ##
 						}
 					}
 				}
@@ -856,7 +889,7 @@ sub processNew {
 #							print "Exclude subnet ".$subnet.": overlaps with excluded net ".$net."\n";
 							$MAIL_EXCLUDES .= "Excluding subnet ".$subnet.": overlaps with excluded net ".$net."\n";
 							$exclude = 1;
-							$logger->debug("Excluding subnet ".$subnet);
+							$logger->info("Excluding subnet_dump ".$subnet);
 							last;
 						}
 					}
@@ -937,6 +970,111 @@ sub proceedOurBlacklist
 				$logger->debug("Added new content from our blacklist: id ".$record_id);
 				$added_records++;
 			}
+
+                        my $uri = URI->new($url);
+                        my $scheme = $uri->scheme();
+
+			#Поддержка IP в локальном блеклисте
+                        if ($scheme eq "ip") {
+                        if( !defined( $OLD_URLS{$url} ) ) {
+                                $url =~ s/^ip\:\/\///;
+				$OLD_URLS{md5_hex(encode_utf8($url))} = 1;  
+                                my $ipa = new Net::IP($url);
+                                my $ip_packed=pack("B*",$ipa->binip());
+                                $sth = $DBH->prepare("INSERT INTO zap2_only_ips(record_id, ip) VALUES(?,?)");
+                                $sth->bind_param(1, $record_id);
+                                $sth->bind_param(2, $ip_packed);
+                                $sth->execute;
+}	else {
+                                # delete from old_true_urls
+                                $url =~ s/^ip\:\/\///;
+                                delete $OLD_TRUE_ONLY_IPS{$url};
+                        }
+
+			}
+
+			if($scheme ne "http" && $scheme ne "https")
+			{
+				$logger->error("Unsupported scheme in url: $url for resolving.");
+			} else {
+				my $url_domain = $uri->host();
+				if( defined( $EX_DOMAINS{$url_domain} ) )
+				{
+					$MAIL_EXCLUDES .= "Excluding URL (caused by excluded domain ".$url_domain."): ".$url."\n";
+					next;
+				}
+				Resolve( $url_domain, $record_id, $resolver, $cv);
+			}
+			if( !defined( $OLD_URLS{md5_hex(encode_utf8($url))} )) {
+				$sth = $DBH->prepare("INSERT INTO zap2_urls(record_id, url) VALUES(?,?)");
+				$sth->bind_param(1, $record_id);
+				$sth->bind_param(2, $url);
+				$sth->execute;
+				$OLD_URLS{md5_hex(encode_utf8($url))} = 1;
+				$MAIL_ADDED .= "Added new URL: ".$url."\n";
+				$logger->debug("Added new URL: ".$url);
+				$added_urls++;
+			} else {
+				# delete from old_true_urls
+				delete $OLD_TRUE_URLS{md5_hex(encode_utf8($url))};
+			}
+		}
+		close $fh;
+
+                # delete old records..
+                foreach my $key (keys %OLD_BLACKLIST_DEL)
+                {
+                        $deleted_old_records++;
+                        delRecord($OLD_BLACKLIST_DEL{$key});
+                }
+        };
+        $logger->error("proceedOurBlackkist: ".$@) if $@;
+}
+
+##################### Работа с файлом списка минюста #######################################
+sub proceedminust
+{
+        my $resolver = shift;
+        my $cv = shift;
+        my %OLD_BLACKLIST;
+        my %OLD_BLACKLIST_DEL;
+        my $sth;
+        eval {
+                # filling old records...
+                $sth = $DBH->prepare("SELECT id,decision_num FROM zap2_records WHERE decision_id = 0 ORDER BY date_add");
+                $sth->execute or die DBI->errstr;
+                while( my $ips = $sth->fetchrow_hashref() )
+                {
+                        $OLD_BLACKLIST{$ips->{decision_num}}=$ips->{id};
+                        $OLD_BLACKLIST_DEL{$ips->{decision_num}}=$ips->{id};
+                }
+
+                my $record_id;
+
+#		getstore("https://www.skydns.ru/downloads/zi-mj-urllist", $file_minust);
+		open (my $fh, $file_minust);
+		while (my $url = <$fh>)
+		{
+			chomp $url;
+			$url = "http://$url";
+			my $md_hex=md5_hex(encode_utf8($url));
+
+			if(defined $OLD_BLACKLIST{$md_hex})
+			{
+				$record_id=$OLD_BLACKLIST{$md_hex};
+				delete $OLD_BLACKLIST_DEL{$md_hex};
+			} else {
+				$sth = $DBH->prepare("INSERT INTO zap2_records(decision_num,decision_org,decision_id) VALUES(?,?,?)");
+				$sth->bind_param(1,$md_hex);
+				$sth->bind_param(2,"minust_blacklist");
+				$sth->bind_param(3,0);
+				$sth->execute;
+				$record_id = $sth->{mysql_insertid};
+				$OLD_BLACKLIST{$md_hex}=$record_id;
+				$MAIL_ADDED .= "Added new content from Minust blacklist: id ".$record_id."\n";
+				$logger->debug("Added new content from Minust blacklist: id ".$record_id);
+				$added_records++;
+			}
 			my $uri = URI->new($url);
 			my $scheme = $uri->scheme();
 			if($scheme ne "http" && $scheme ne "https")
@@ -974,8 +1112,9 @@ sub proceedOurBlacklist
 			delRecord($OLD_BLACKLIST_DEL{$key});
 		}
 	};
-	$logger->error("proceedOurBlackkist: ".$@) if $@;
+	$logger->error("proceedMinust: ".$@) if $@;
 }
+############################################################################################################
 
 sub getOld {
 	%OLD = ();
@@ -1290,7 +1429,7 @@ sub resolve_async
 			}
 			if ($ipa->iptype() ne "PUBLIC" && $ipa->iptype() ne "GLOBAL-UNICAST")
 			{
-				$logger->info("Bad ip type: ".$ipa->iptype()." for ip $ip host $host");
+				$logger->debug("Bad ip type: ".$ipa->iptype()." for ip $ip host $host");
 				next;
 			}
 			my $exclude = 0;
@@ -1298,20 +1437,23 @@ sub resolve_async
 			{
 				my $ipadr = NetAddr::IP->new( $ip );
 				my $net = NetAddr::IP->new( $subnet );
-				if( $ipadr && $net ) {
+
+					if( $ipadr && $net ) {
 					if( $ipadr->within($net) ) {
 						#print "Excluding ip ".$ip.": overlaps with excluded subnet ".$subnet."\n";
-						$logger->debug("Excluding ip ".$ip);
-						$MAIL_EXCLUDES .= "Excluding new ip: ".$ip."\n";
+						$logger->info("Excluding ip ".$ip . " HOST: ".$host);
+						$MAIL_EXCLUDES .= "Excluding new ip: ".$ip." HOST ".$host."\n";
 						$exclude = 1;
 						last;
-					}
+			}
+
 				}
 			}
 			if( defined($EX_IPS{$ip}) )
 			{
-				$logger->debug("Excluding ip ".$ip);
+				$logger->info("Excluding ip ".$ip . " HOST: ".$host);
 				$exclude = 1;
+				next;
 			}
 		
 			if( $exclude == 1 ) {
@@ -1370,7 +1512,7 @@ sub resolve_async
 				if( $ipadr && $net ) {
 					if( $ipadr->within($net) ) {
 						#print "Excluding ip ".$ip.": overlaps with excluded subnet ".$subnet."\n";
-						$logger->debug("Excluding ip ".$ip);
+						$logger->debug("Excluding ip ".$ip . " HOST: ".$host);
 						$MAIL_EXCLUDES .= "Excluding new ip: ".$ip."\n";
 						$exclude = 1;
 						last;
@@ -1379,7 +1521,7 @@ sub resolve_async
 			}
 			if( defined($EX_IPS{$ip}) )
 			{
-				$logger->debug("Excluding ip ".$ip);
+				$logger->debug("Excluding ip ".$ip . " HOST: ".$host);
 				$exclude = 1;
 			}
 		
